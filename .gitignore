@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+# eval: avoid committing per-instance repo clones, patches, or scored reports
+datasets/workspaces/
+datasets/*.jsonl
+datasets/*-instances.json
+outputs/
+!outputs/.gitkeep
+!datasets/.gitkeep
