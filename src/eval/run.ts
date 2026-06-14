@@ -265,27 +265,28 @@ async function pathExists(p: string): Promise<boolean> {
 }
 
 async function checkoutCommit(repoDir: string, commit: string): Promise<void> {
-  // Detach HEAD to the target commit. `--detach` avoids branch-name resolution
-  // failures when the working tree has never had a checked-out branch (which is
-  // the case after `git clone --no-checkout`).
-  await execFile("git", ["checkout", "--detach", commit], { cwd: repoDir });
-  // CRLF normalization for Windows. If a previous run cloned the repo with
-  // the OS-default `core.autocrlf=true`, files in the working tree are CRLF
-  // but the diff we capture is LF — so when swebench later runs `git apply`
-  // strict, the 3-line hunk context fails to match. We re-set autocrlf to
-  // false (idempotent, the safe value on macOS/Linux) and then re-fill the
-  // working tree from the git objects so any CRLF cache gets rewritten as
-  // LF.
+  // Force the working tree to a clean LF state on Windows.
   //
-  // We deliberately do NOT pass `-f` to checkout-index: on Windows the
-  // 260-char MAX_PATH limit makes some files in repos like
-  // gravitational/teleport uncacheable, and `-f` would make git exit non-zero
-  // on those paths. Without `-f` git skips the unwriteable files and
-  // continues — those files are never the ones the agent needs to modify
-  // anyway.
+  // Background: Windows defaults to `core.autocrlf=true`, which rewrites
+  // LF→CRLF on checkout. Our captured diff is LF, so when swebench later
+  // runs `git apply` against the (CRLF) working tree, hunk context lines
+  // fail to match and the patch is rejected. We set autocrlf=false BEFORE
+  // the first checkout so files are written as LF from the start. This is
+  // safe on macOS/Linux where autocrlf=false is already the default.
+  //
+  // We previously also ran `git read-tree HEAD` + `git checkout-index -a`
+  // here as a belt-and-suspenders CRLF re-normalization. That turned out
+  // to be a footgun: `checkout-index -a` errors out on any pre-existing
+  // file ("already exists, no checkout"), and even when the first
+  // `git checkout` had already populated the tree, a stale half-clone
+  // could leave enough files behind to fail the second pass. Removing
+  // the redundant re-fill and trusting the autocrlf=false + checkout
+  // below is enough.
   await execFile("git", ["config", "core.autocrlf", "false"], { cwd: repoDir });
-  await execFile("git", ["read-tree", "HEAD"], { cwd: repoDir });
-  await execFile("git", ["checkout-index", "-a"], { cwd: repoDir });
+  // `--detach` avoids branch-name resolution failures when the working
+  // tree has never had a checked-out branch (the case after
+  // `git clone --no-checkout`).
+  await execFile("git", ["checkout", "--detach", commit], { cwd: repoDir });
 }
 
 export async function runOne(
