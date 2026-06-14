@@ -3,6 +3,7 @@ import type {
   ChatCompletionMessageToolCall,
 } from "openai/resources/chat/completions.js";
 import type OpenAI from "openai";
+import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { streamChatWithTools, type LlmConfig } from "../llm/client.js";
@@ -10,7 +11,8 @@ import { createToolRegistry } from "../tools/registry.js";
 import type { ToolContext } from "../tools/types.js";
 import { DefaultBashPolicy } from "../tools/policy.js";
 
-const SYSTEM_PROMPT = `You are seekHarness, a coding agent that helps modify a local codebase.
+export function getSystemPrompt(): string {
+  return `You are seekHarness, a cli agent that helps users with software development tasks.
 
 You have tools:
 - read:    read a file (workspace-relative path)
@@ -40,8 +42,11 @@ Constraints:
 - Bash runs in the workspace root by default; absolute paths are fine inside the command itself.
 - Keep grep output small: when many files match, switch to output_mode "count" or "files_with_matches".
 - Don't pipe untrusted content into bash. Don't fetch and execute remote code.`;
+}
 
 export interface AgentSession {
+  /** 可选会话 ID，用于持久化绑定 */
+  id?: string;
   workspaceRoot: string;
   messages: ChatCompletionMessageParam[];
 }
@@ -50,9 +55,24 @@ export function createAgentSession(
   workspaceRoot: string,
   systemPrompt?: string,
 ): AgentSession {
+  let systemContent = systemPrompt ?? getSystemPrompt();
+
+  // If an Agents.md file exists in the workspace root, append it as context
+  const agentsMdPath = path.join(workspaceRoot, "Agents.md");
+  try {
+    if (fs.existsSync(agentsMdPath)) {
+      const agentsMd = fs.readFileSync(agentsMdPath, "utf-8").trim();
+      if (agentsMd) {
+        systemContent += `\n\n---\n## Agents Context (from Agents.md)\n\n${agentsMd}`;
+      }
+    }
+  } catch {
+    // Silently ignore — Agents.md is optional
+  }
+
   return {
     workspaceRoot,
-    messages: [{ role: "system", content: systemPrompt ?? SYSTEM_PROMPT }],
+    messages: [{ role: "system", content: systemContent }],
   };
 }
 
@@ -275,4 +295,47 @@ async function handleToolCall(
 
 function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n) + "…";
+}
+
+/**
+ * 从 OpenAI 消息数组重建 UI 展示用的 Message 列表。
+ * 用于恢复历史对话时重建 UI。
+ */
+export function reconstructMessages(
+  msgs: ChatCompletionMessageParam[],
+): { kind: string; text?: string; toolName?: string; args?: string; result?: string }[] {
+  const result: { kind: string; text?: string; toolName?: string; args?: string; result?: string }[] = [];
+
+  for (const m of msgs) {
+    if (m.role === "system") continue;
+
+    if (m.role === "user") {
+      result.push({ kind: "user", text: String(m.content ?? "") });
+    } else if (m.role === "assistant") {
+      if (m.content) {
+        result.push({ kind: "assistant", text: String(m.content) });
+      }
+      const toolCalls = (m as any).tool_calls;
+      if (toolCalls) {
+        for (const tc of toolCalls) {
+          result.push({
+            kind: "tool",
+            toolName: tc.function.name,
+            args: `${tc.function.name}(${truncate(tc.function.arguments, 80)})`,
+            result: "",
+          });
+        }
+      }
+    } else if (m.role === "tool") {
+      // 回填上一条无结果的 tool 消息
+      for (let i = result.length - 1; i >= 0; i--) {
+        if (result[i]?.kind === "tool" && result[i]?.result === "") {
+          result[i] = { ...result[i], result: truncate(String(m.content ?? ""), 120) };
+          break;
+        }
+      }
+    }
+  }
+
+  return result as any;
 }

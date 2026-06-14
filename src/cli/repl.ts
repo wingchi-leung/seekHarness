@@ -9,9 +9,13 @@ export interface ReplOptions {
   llmConfig: LlmConfig;
   workspaceRoot: string;
   initialMessage?: string;
+  /** 要恢复的会话 ID（来自 --resume / --session） */
+  resumeSessionId?: string;
 }
 
 export async function runRepl(options: ReplOptions): Promise<void> {
-  const { waitUntilExit } = render(createElement(Repl, options));
+  const { waitUntilExit } = render(createElement(Repl, options), {
+    exitOnCtrlC: false,
+  });
   await waitUntilExit();
 }
