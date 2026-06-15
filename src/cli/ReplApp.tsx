@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import TextInput from "ink-text-input";
+import fs from "node:fs";
+import path from "node:path";
 import type OpenAI from "openai";
 import type { LlmConfig } from "../llm/client.js";
 import {
@@ -47,6 +49,7 @@ function printHelp(): string {
     "  /sessions     列出已保存的会话",
     "  /load <id>    恢复指定会话",
     "  /delete <id>  删除指定会话",
+    "  /reload       重新加载工作目录下的 Agents.md",
     "  /exit, /quit  退出",
     "  Ctrl+C        停止当前操作",
     "",
@@ -112,7 +115,7 @@ export function Repl(props: ReplProps): React.ReactElement {
         return;
       }
       // Esc → 返回 idle
-      if (input === "\x1b") {
+      if (key.escape) {
         setMode({ kind: "idle" });
         return;
       }
@@ -158,6 +161,7 @@ export function Repl(props: ReplProps): React.ReactElement {
         workspaceRoot,
         llmConfig.model,
         sessionId,
+        s.toolTimestamps,
       );
       setSessionId(id);
       return id;
@@ -175,7 +179,7 @@ export function Repl(props: ReplProps): React.ReactElement {
   }, []);
 
   async function doResume(id: string): Promise<void> {
-    const loaded = await loadSession(id);
+    const loaded = await loadSession(id, workspaceRoot);
     if (!loaded) {
       setMessages((m) => [
         ...m,
@@ -193,6 +197,7 @@ export function Repl(props: ReplProps): React.ReactElement {
       id: loaded.meta.id,
       workspaceRoot: loaded.meta.workspaceRoot,
       messages: loaded.messages,
+      toolTimestamps: (loaded as any).toolTimestamps ?? {},
     };
     setSessionId(loaded.meta.id);
 
@@ -297,7 +302,7 @@ export function Repl(props: ReplProps): React.ReactElement {
       setMode({ kind: "resume-picker", sessions: [], cursor: 0, loading: true });
 
       try {
-        const sessions = await listSessions();
+        const sessions = await listSessions(workspaceRoot);
         setMode({ kind: "resume-picker", sessions, cursor: 0, loading: false });
       } catch {
         setMode({ kind: "resume-picker", sessions: [], cursor: 0, loading: false });
@@ -312,7 +317,7 @@ export function Repl(props: ReplProps): React.ReactElement {
       setMessages((m) => [...m, { kind: "user", text: trimmed }]);
 
       try {
-        const sessions = await listSessions();
+        const sessions = await listSessions(workspaceRoot);
         setMode({ kind: "sessions", sessions, loading: false });
       } catch {
         setMode({ kind: "sessions", sessions: [], loading: false });
@@ -332,7 +337,7 @@ export function Repl(props: ReplProps): React.ReactElement {
         ]);
         return;
       }
-      const ok = await deleteSession(id);
+      const ok = await deleteSession(id, workspaceRoot);
       setMessages((m) => [
         ...m,
         { kind: "user", text: trimmed },
@@ -354,7 +359,7 @@ export function Repl(props: ReplProps): React.ReactElement {
         return;
       }
 
-      const loaded = await loadSession(id);
+      const loaded = await loadSession(id, workspaceRoot);
       if (!loaded) {
         setMessages((m) => [
           ...m,
@@ -368,6 +373,7 @@ export function Repl(props: ReplProps): React.ReactElement {
         id: loaded.meta.id,
         workspaceRoot: loaded.meta.workspaceRoot,
         messages: loaded.messages,
+        toolTimestamps: (loaded as any).toolTimestamps ?? {},
       };
       setSessionId(loaded.meta.id);
       const uiMessages = reconstructMessages(loaded.messages) as Message[];
@@ -376,6 +382,24 @@ export function Repl(props: ReplProps): React.ReactElement {
       setMessages((prev) => [
         ...prev,
         { kind: "assistant", text: `\x1b[32m✓\x1b[0m 已加载会话 ${id}` },
+      ]);
+      return;
+    }
+
+    // ── /reload — 查看当前 Agents.md ──
+    if (trimmed === "/reload") {
+      setInput("");
+      const p = path.join(workspaceRoot, "Agents.md");
+      let text = "\x1b[33m未找到 Agents.md\x1b[0m";
+      try {
+        if (fs.existsSync(p)) {
+          text = `当前 \x1b[2mAgents.md\x1b[0m 内容：\n${fs.readFileSync(p, "utf-8").trim() || "(空)"}`;
+        }
+      } catch { /* ignore */ }
+      setMessages((m) => [
+        ...m,
+        { kind: "user", text: trimmed },
+        { kind: "assistant", text },
       ]);
       return;
     }

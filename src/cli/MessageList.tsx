@@ -1,13 +1,12 @@
 import React from "react";
-import { Box } from "ink";
+import { Box, Static } from "ink";
 import { MessageView, type Message } from "./MessageView.js";
 
 /**
- * Renders the conversation history. We deliberately do NOT use Ink's
- * <Static> here: in V1 the entire list is rendered live (no flicker since
- * the input box is small and only the streaming row actually changes).
- * Upgrading to <Static> for true "history stays put" rendering is a
- * future optimization.
+ * Renders the conversation history.
+ * Completed messages use <Static> so Ink renders them once and never
+ * re-renders — this keeps the terminal scroll position stable when
+ * the list grows beyond viewport height.
  */
 export function MessageList({
   completed,
@@ -18,9 +17,9 @@ export function MessageList({
 }): React.ReactElement {
   return (
     <Box flexDirection="column">
-      {completed.map((m, i) => (
-        <MessageView key={i} message={m} />
-      ))}
+      <Static items={completed}>
+        {(m, i) => <MessageView key={i} message={m} />}
+      </Static>
       {streaming && <MessageView message={streaming} />}
     </Box>
   );

@@ -129,6 +129,7 @@ export async function streamChatWithTools(
   );
 
   let content = "";
+  let reasoningContent: string | undefined;
   // Accumulate tool call deltas by index
   const toolCallAccumulators = new Map<
     number,
@@ -137,12 +138,17 @@ export async function streamChatWithTools(
 
   for await (const chunk of stream) {
     const delta = chunk.choices[0]?.delta;
-    const finishReason = chunk.choices[0]?.finish_reason;
 
     // ── Stream text content ──
     if (delta?.content) {
       content += delta.content;
       onContent(delta.content);
+    }
+
+    // ── Accumulate reasoning_content (DeepSeek reasoning model) ──
+    const rc = (delta as any)?.reasoning_content;
+    if (rc) {
+      reasoningContent = (reasoningContent ?? "") + rc;
     }
 
     // ── Accumulate tool call deltas ──
@@ -172,18 +178,14 @@ export async function streamChatWithTools(
   }
 
   // ── Build the full assistant message ──
-  // An assistant message must carry EITHER content OR tool_calls. Some
-  // providers (notably DeepSeek on certain tool-heavy turns) stream
-  // `tool_calls` deltas with no `delta.content` chunks at all, leaving us
-  // with content === "". The OpenAI/DeepSeek validator rejects messages
-  // where content is missing AND tool_calls is also missing, so we
-  // always send a non-null content string.
-  const assistantMsg: ChatCompletionMessageParam & {
-    tool_calls?: ChatCompletionMessageToolCall[];
-  } = {
+  const assistantMsg: Record<string, unknown> = {
     role: "assistant",
     content,
   };
+
+  if (reasoningContent) {
+    assistantMsg.reasoning_content = reasoningContent;
+  }
 
   if (toolCallAccumulators.size > 0) {
     assistantMsg.tool_calls = Array.from(toolCallAccumulators.entries())
@@ -198,5 +200,5 @@ export async function streamChatWithTools(
       }));
   }
 
-  return assistantMsg as ChatCompletionMessageParam;
+  return assistantMsg as unknown as ChatCompletionMessageParam;
 }

@@ -10,70 +10,61 @@ import { streamChatWithTools, type LlmConfig } from "../llm/client.js";
 import { createToolRegistry } from "../tools/registry.js";
 import type { ToolContext } from "../tools/types.js";
 import { DefaultBashPolicy } from "../tools/policy.js";
-
-export function getSystemPrompt(): string {
-  return `You are seekHarness, a cli agent that helps users with software development tasks.
-
-You have tools:
-- read:    read a file (workspace-relative path)
-- write:   create or overwrite a file. Overwriting an existing file requires reading it first in this session.
-- edit:    replace an exact unique substring in a file. Use read first to get exact content.
-- glob:    find files by name pattern, e.g. "src/**/*.ts". Sorted by mtime, capped at 100. Does not respect .gitignore.
-- grep:    search file contents by regex (ripgrep syntax). Respects .gitignore.
-           output_mode: "files_with_matches" (default) | "content" (file:line:content) | "count".
-           Use include to scope by file glob, e.g. include="*.ts".
-- bash:    run a shell command. cwd is the workspace root each call. Default 2min timeout, max 10min.
-           Output >30000 chars is truncated and saved to a temp file (path returned).
-           Use bash to verify: build (e.g. \`npx tsc --noEmit\`), test, lint, git status.
-
-Workflow:
-1. Understand: use glob/grep to map the codebase. Don't guess paths.
-2. Read before you write: read first, then edit/write. Use edit for small changes, write for new files.
-3. Verify: after non-trivial changes, run a build/test command via bash to confirm nothing broke.
-4. Recover: if a tool returns an error, read the error, adjust, retry. Don't repeat the same failing call.
-5. Finish: when done, reply to the user without calling more tools.
-
-Safety: bash is gated by a deny-list (rm -rf /, mkfs, fork bombs, curl|sh, etc.). The user can set
-SEEKHARNESS_ALLOW_DANGEROUS=1 to override. When set, you'll see a red warning printed to the terminal
-(the warning is for the human, not part of the tool result).
-
-Constraints:
-- All file paths in read/write/edit/glob/grep are relative to the workspace root.
-- Bash runs in the workspace root by default; absolute paths are fine inside the command itself.
-- Keep grep output small: when many files match, switch to output_mode "count" or "files_with_matches".
-- Don't pipe untrusted content into bash. Don't fetch and execute remote code.`;
-}
+import {
+  buildSystemMessages,
+  agentsMdSection,
+  type PromptSection,
+} from "./prompt.js";
+import {
+  truncateOutput,
+  compressHistory,
+  markToolTimestamp,
+  createToolTimestampStore,
+  type ToolTimestampStore,
+} from "./context.js";
+import {
+  type TraceEntry,
+  type TraceCallback,
+  type TraceExitReason,
+  createTraceWriter,
+} from "./trace.js";
 
 export interface AgentSession {
   /** 可选会话 ID，用于持久化绑定 */
   id?: string;
   workspaceRoot: string;
   messages: ChatCompletionMessageParam[];
+  /** tool result 时间戳（可序列化），防线2 用 */
+  toolTimestamps: ToolTimestampStore;
 }
 
 export function createAgentSession(
   workspaceRoot: string,
   systemPrompt?: string,
+  extraSections?: PromptSection[],
 ): AgentSession {
-  let systemContent = systemPrompt ?? getSystemPrompt();
+  const messages: ChatCompletionMessageParam[] = systemPrompt
+    ? [{ role: "system", content: systemPrompt }]
+    : buildSystemMessages({ extraSections });
 
-  // If an Agents.md file exists in the workspace root, append it as context
+  return { workspaceRoot, messages, toolTimestamps: createToolTimestampStore() };
+}
+
+/**
+ * 读取当前磁盘上的 Agents.md，格式化为 system message 内容。
+ * 读不到或内容为空时返回 undefined。
+ */
+function readAgentsMd(workspaceRoot: string): string | undefined {
   const agentsMdPath = path.join(workspaceRoot, "Agents.md");
   try {
     if (fs.existsSync(agentsMdPath)) {
-      const agentsMd = fs.readFileSync(agentsMdPath, "utf-8").trim();
-      if (agentsMd) {
-        systemContent += `\n\n---\n## Agents Context (from Agents.md)\n\n${agentsMd}`;
-      }
+      const content = fs.readFileSync(agentsMdPath, "utf-8").trim();
+      if (content) return agentsMdSection(content).content;
     }
   } catch {
-    // Silently ignore — Agents.md is optional
+    // Silently ignore
   }
-
-  return {
-    workspaceRoot,
-    messages: [{ role: "system", content: systemContent }],
-  };
+  return undefined;
 }
 
 export interface TurnStreamInfo {
@@ -91,6 +82,10 @@ export interface AgentTurnOptions {
   onTurn?: (info: { turn: number; role: string; preview: string }) => void;
   /** Streaming callback – called progressively for real-time output */
   onStream?: (info: TurnStreamInfo) => void;
+  /** Trace callback – called once per lifecycle event with full, lossless data */
+  onTrace?: TraceCallback;
+  /** 如果传了 traceDir，自动写 trace JSONL 文件到该目录（文件名按时间生成） */
+  traceDir?: string;
   /** AbortSignal to cancel the entire agent turn mid-flight */
   signal?: AbortSignal;
 }
@@ -106,13 +101,34 @@ export async function runAgentTurn(
   options: AgentTurnOptions
 ): Promise<AgentLoopResult> {
   const { client, llmConfig, maxTurns = 100, onTurn, onStream, signal } = options;
+  const turnStartTime = Date.now();
 
+  // 自动写 trace JSONL——除非调用方传了 onTrace，否则写到 ~/.seekharness/traces/
+  const traceDir = options.traceDir ?? path.join(os.homedir(), ".seekharness", "traces");
+  let traceWriter: ReturnType<typeof createTraceWriter> | null = null;
+  let onTrace: TraceCallback | undefined = options.onTrace;
+  if (!onTrace) {
+    fs.mkdirSync(traceDir, { recursive: true });
+    const traceName = `${Date.now()}-${path.basename(session.workspaceRoot).replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+    traceWriter = createTraceWriter(path.join(traceDir, `${traceName}.jsonl`));
+    onTrace = (entry) => traceWriter!.write(entry);
+  }
+
+  try {
   // Fast-fail if already aborted
   if (signal?.aborted) {
     throw new Error("Agent turn cancelled (signal already aborted)");
   }
 
   session.messages.push({ role: "user", content: userMessage });
+
+  // ── Trace: user input ──
+  onTrace?.({
+    ts: turnStartTime,
+    type: "user_input",
+    turn: 0,
+    text: userMessage,
+  });
 
   const registry = createToolRegistry();
   const toolCtx: ToolContext = {
@@ -126,15 +142,40 @@ export async function runAgentTurn(
 
   let turns = 0;
   let finalText = "";
+  let totalToolCalls = 0;
+  let exitReason: TraceExitReason = "no_tool_calls";
+
+  // Loop-detection state: track how many times each (tool, args) pair has been called.
+  // If any single signature hits MAX_REPEAT we nudge the model once, then hard-break.
+  const callSignatures = new Map<string, number>();
+  const MAX_REPEAT = 3;
+  let loopNudgeSent = false;
 
   while (turns < maxTurns) {
     // Check for cancellation before each turn
     if (signal?.aborted) {
       finalText += "\n\n[Stopped: cancelled]";
+      exitReason = "cancelled";
       break;
     }
 
     turns++;
+
+    // ── Build request messages (session messages + fresh Agents.md) ──
+    const agentsMdContent = readAgentsMd(session.workspaceRoot);
+    const requestMessages = agentsMdContent
+      ? [...messages, { role: "system" as const, content: agentsMdContent }]
+      : messages;
+
+    // ── Trace: LLM start ──
+    const llmStartTime = Date.now();
+    onTrace?.({
+      ts: llmStartTime,
+      type: "llm_start",
+      turn: turns,
+      messageCount: requestMessages.length,
+      toolCount: registry.definitions.length,
+    });
 
     // ── Stream the LLM response ──
     let assistantContent = "";
@@ -142,7 +183,7 @@ export async function runAgentTurn(
     const assistantMsg = await streamChatWithTools(
       client,
       llmConfig,
-      messages,
+      requestMessages,
       registry.definitions,
       (chunk: string) => {
         assistantContent += chunk;
@@ -154,6 +195,22 @@ export async function runAgentTurn(
       },
       { signal },
     );
+
+    // ── Trace: LLM end ──
+    const llmEndTime = Date.now();
+    const toolCalls = (assistantMsg as any).tool_calls ?? [];
+    onTrace?.({
+      ts: llmEndTime,
+      type: "llm_end",
+      turn: turns,
+      content: assistantContent || null,
+      toolCalls: toolCalls.map((tc: any) => ({
+        id: tc.id,
+        name: tc.function.name,
+        args: tc.function.arguments,
+      })),
+      durationMs: llmEndTime - llmStartTime,
+    });
 
     messages.push(assistantMsg);
 
@@ -169,10 +226,9 @@ export async function runAgentTurn(
       });
     }
 
-    const toolCalls = (assistantMsg as any).tool_calls ?? [];
-
     // No tool calls → we're done with this turn
     if (toolCalls.length === 0) {
+      exitReason = "no_tool_calls";
       break;
     }
 
@@ -188,13 +244,23 @@ export async function runAgentTurn(
     const execOne = async (call: ChatCompletionMessageToolCall): Promise<void> => {
       if (signal?.aborted) return; // skip if cancelled mid-batch
 
+      // ── Trace: tool start ──
+      onTrace?.({
+        ts: Date.now(),
+        type: "tool_start",
+        turn: turns,
+        toolCallId: call.id,
+        toolName: call.function.name,
+        args: call.function.arguments,
+      });
+
       onStream?.({
         turn: turns,
         type: "tool_start",
         text: `${call.function.name}(${truncate(call.function.arguments, 80)})`,
       });
 
-      const result = await handleToolCall(call, registry, toolCtx, onTurn, turns);
+      const result = await handleToolCall(call, registry, toolCtx, onTurn, turns, session.toolTimestamps, onTrace);
       resultsByCallId.set(call.id, result);
 
       onStream?.({
@@ -219,13 +285,58 @@ export async function runAgentTurn(
       const result = resultsByCallId.get(call.id);
       if (result) messages.push(result);
     }
+
+    totalToolCalls += toolCalls.length;
+
+    // ── Loop detection: track repeated (tool, args) signatures ──
+    let repeatDetected = false;
+    for (const call of toolCalls) {
+      const sig = `${call.function.name}:${call.function.arguments}`;
+      const count = (callSignatures.get(sig) ?? 0) + 1;
+      callSignatures.set(sig, count);
+      if (count >= MAX_REPEAT) repeatDetected = true;
+    }
+
+    if (repeatDetected) {
+      exitReason = "loop_detected";
+      if (!loopNudgeSent) {
+        // Give the model one chance to wrap up gracefully.
+        messages.push({
+          role: "user",
+          content:
+            "[System: You appear to be stuck — the same tool call has been made 3+ times with identical arguments. Stop calling tools and provide your final answer now.]",
+        });
+        loopNudgeSent = true;
+      } else {
+        // Model still looping after the nudge — hard stop.
+        finalText += "\n\n[Stopped: loop detected]";
+        break;
+      }
+    }
+
+    //  每轮工具执行后，检查消息预算，超了就从最老的开始裁
+    compressHistory(messages, session.toolTimestamps);
   }
 
   if (turns >= maxTurns) {
     finalText += "\n\n[Stopped: max turns reached]";
+    exitReason = "max_turns";
   }
 
+  // ── Trace: exit ──
+  onTrace?.({
+    ts: Date.now(),
+    type: "exit",
+    turn: turns,
+    reason: exitReason,
+    durationMs: Date.now() - turnStartTime,
+    totalToolCalls,
+  });
+
   return { finalText, turns };
+  } finally {
+    traceWriter?.close();
+  }
 }
 
 /** @deprecated Use createAgentSession + runAgentTurn for multi-turn chat */
@@ -252,21 +363,39 @@ async function handleToolCall(
   registry: ReturnType<typeof createToolRegistry>,
   toolCtx: ToolContext,
   onTurn: AgentTurnOptions["onTurn"],
-  turn: number
+  turn: number,
+  store: ToolTimestampStore,
+  onTrace?: TraceCallback,
 ): Promise<ChatCompletionMessageParam> {
   const fn = call.function;
   let args: unknown = {};
+  const toolStartTime = Date.now();
 
   try {
     args = JSON.parse(fn.arguments || "{}");
   } catch {
     const errMsg = "Invalid JSON in tool arguments";
     onTurn?.({ turn, role: "tool", preview: `${fn.name}: ${errMsg}` });
-    return {
+    const errResult: ChatCompletionMessageParam = {
       role: "tool",
       tool_call_id: call.id,
       content: errMsg,
     };
+    markToolTimestamp(errResult, store);
+
+    // ── Trace: tool end (error) ──
+    onTrace?.({
+      ts: Date.now(),
+      type: "tool_end",
+      turn,
+      toolCallId: call.id,
+      toolName: fn.name,
+      output: errMsg,
+      success: false,
+      durationMs: Date.now() - toolStartTime,
+    });
+
+    return errResult;
   }
 
   onTurn?.({
@@ -276,9 +405,24 @@ async function handleToolCall(
   });
 
   const result = await registry.run(fn.name, args, toolCtx);
-  const content = result.success
+
+  // ── Trace: tool end (full output, before truncation) ──
+  const fullOutput = result.success
     ? result.output
     : `Error: ${result.output}`;
+  onTrace?.({
+    ts: Date.now(),
+    type: "tool_end",
+    turn,
+    toolCallId: call.id,
+    toolName: fn.name,
+    output: fullOutput,
+    success: result.success,
+    durationMs: Date.now() - toolStartTime,
+  });
+
+  // 防线1：对工具结果做首尾截断，大输出自动写完整文件
+  const content = await truncateOutput(fullOutput, fn.name, toolCtx.largeOutputDir);
 
   onTurn?.({
     turn,
@@ -286,11 +430,13 @@ async function handleToolCall(
     preview: truncate(content, 120),
   });
 
-  return {
+  const resultMsg: ChatCompletionMessageParam = {
     role: "tool",
     tool_call_id: call.id,
     content,
   };
+  markToolTimestamp(resultMsg, store);
+  return resultMsg;
 }
 
 function truncate(s: string, n: number): string {

@@ -71,40 +71,6 @@ const assistantMsg = await streamChatWithTools(
 
 OpenAI / Anthropic API 在传 `tools` 参数时已经会告诉 LLM 每个工具的名称、参数、描述。system prompt 里再用文本写一遍等于重复消耗 token。
 
-### 问题 3：System Prompt 结构扁平
-
-当前 system prompt 把所有信息平铺在一个字符串里：
-
-```
-身份 + 工具列表 + 工作流 + 安全规则 + 约束 + Agents.md
-```
-
-这些信息有不同的**重要层级**和**变更频率**：
-
-| 信息 | 层级 | 变更频率 |
-|---|---|---|
-| Agent 身份 | 高 | 几乎不变 |
-| 工具列表 | 高 | 新增工具时才变 |
-| 工作流步骤 | 中 | 迭代时调整 |
-| 安全策略 | 高 | 几乎不变 |
-| 约束条件 | 中 | 随工具调整 |
-| Agents.md | 高（按需） | 用户随时可能改 |
-
-混在一起导致：
-- LLM 可能忽略后半部分的内容（"中间迷失"问题）
-- 修改某一部分时需要动整个字符串
-- Agents.md 内容在长 system prompt 中容易被淹没
-
-### 问题 4：Agents.md 只在 Session 启动时加载
-
-```ts
-function createAgentSession(workspaceRoot, systemPrompt?) {
-  // 读取 Agents.md（仅在创建 session 时）
-  const agentsMdPath = path.join(workspaceRoot, "Agents.md");
-  // ... 读到后塞进 system message
-}
-```
-
 用户修改了 `Agents.md` 后需要重启 `seekharness` 才生效。对于长期运行的 REPL 会话来说不够灵活。
 
 ### 问题 5：工具结果缺乏大小控制
@@ -125,39 +91,173 @@ return {
 
 `bash` 工具虽然有溢出文件机制（超过 30000 字符写到临时文件），但 messages 里存的仍是完整输出。
 
-## 改进方向
+---
 
-### 方向 A：消息预算管理（预算裁剪）
-
-为 session 引入一个 token 预算概念。当累积的消息超过预算时，对旧消息进行处理。
-
-**策略选项**：
+## 改进方案：两条防线
 
 ```
-A1. 滑动窗口
-    保留最近的 N 条消息，移除中间的工具结果。
-
-A2. 摘要压缩
-    对早期的工具调用链，让 LLM 生成一段摘要替代原始消息。
-    "你之前做了：find schema → read models.py → update field type"
-
-A3. 分层保留
-    保留 system message + 最近 1-2 轮完整对话
-    中间轮次只保留 assistant 回复，丢弃工具结果
+┌──────────────────────────────────────────────────────────────────┐
+│                   发送给 LLM 之前的 messages                       │
+│                                                                  │
+│   [system] [user1] [asst1] [tool1] [user2] [asst2] [tool2] ...  │
+│                                       │                          │
+│   ┌───────────────────────────────────┘                          │
+│   ▼                                                              │
+│   防线1：工具结果截断（源头控制）                                  │
+│   → 每个 tool result 写入时，超过阈值就截断 + 存文件               │
+│                                                                  │
+│   ┌───────────────────────────────────┐                          │
+│   ▼                                   ▼                          │
+│   防线2：历史消息裁剪（墙钟时间 eviction）                           │
+│   → 超过 5 分钟的 tool result 自动裁掉，user/assistant 不动          │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-**推荐：先做 A1，简单有效。**
+### 防线 1：工具结果截断（方向 C）
 
-保留：
-- system message（始终保留）
-- 最近 2 轮 user + assistant + tool 的完整对话
-- 第一轮 user message（不丢失原始目标）
+在工具结果写入 messages **之前**做截断，同时写入完整文件：
 
-裁剪：
-- 删除中间轮次的 tool result（bash 输出、read 内容等）
-- 在删除位置插入一条压缩提示：`[turn 3-5 的工具结果已裁剪，共 ~12k tokens]`
+```ts
+const MAX_PREFIX = 3000;
+const MAX_SUFFIX = 2000;
+const MAX_TOTAL = MAX_PREFIX + MAX_SUFFIX + 200; // ~5200
 
-### 方向 B：精简 System Prompt
+async function truncateOutput(
+  output: string,
+  toolName: string,
+  outputDir?: string,
+): Promise<string> {
+  if (output.length <= MAX_TOTAL) return output;
+
+  const prefix = output.slice(0, MAX_PREFIX);
+  const suffix = output.slice(-MAX_SUFFIX);
+  const truncatedLen = output.length - MAX_PREFIX - MAX_SUFFIX;
+
+  // 写完整输出到文件（LLM 可按需 read）
+  let filePath = ".seekharness/output.txt";
+  if (outputDir) {
+    await fs.mkdir(outputDir, { recursive: true });
+    const filename = `${toolName}-${Date.now()}-${randomBytes(4).toString("hex")}.txt`;
+    filePath = path.join(outputDir, filename);
+    await fs.writeFile(filePath, output, "utf-8");
+  }
+
+  return [
+    prefix,
+    `\n\n[... ${truncatedLen.toLocaleString()} chars truncated; `,
+    `full ${toolName} output saved to: ${filePath}]\n\n`,
+    suffix,
+    '\n\n[Use the read tool with the path above to see full output]',
+  ].join('');
+}
+```
+
+**为什么截断而不是全量存文件？**
+- LLM 需要看到工具结果的**开头**（知道执行了什么）和**结尾**（知道结果/错误）
+- 中间的详细输出是"按需查阅"的，不是每轮都需要
+- 截断后的消息很小，可以留在 messages 中很久不被裁
+
+**与 bash 30000 字符溢出机制的关系：**
+
+| 层 | 位置 | 阈值 | 行为 |
+|---|---|---|---|
+| tool层 (bash) | `bash` 工具内部 | 30k chars 溢出 | 完整写入文件；messages 存完整内容 + 文件路径 |
+| context层 (防线1) | `handleToolCall` | ~5k chars 截断 | 保留首尾 + 文件路径；**第二道防线** |
+
+两层可以共存：bash 存完整文件，context 层做截断。即使 bash 未来改成了流式输出（不存文件），context 层的截断仍然兜底。
+
+**截断后的信息流：**
+
+```
+bash("npm test") 输出 50000 chars
+        │
+        ▼
+tool层：写完整文件 .seekharness/output_xxx.txt
+        │
+        ▼
+context层：截断后存入 messages
+  "[npm test 输出开头...] ...truncated... [npm test 输出结尾...]"
+  "Use read .seekharness/output_xxx.txt to see full output"
+        │
+        ▼
+LLM 看到截断内容 → 如果发现关键信息被截了 → 调用 read 工具读取完整文件
+```
+
+---
+
+### 防线 2：历史消息裁剪 — Content Eviction（Claude Code 风格）
+
+#### 核心思路
+
+不动消息结构，只替换旧 tool 结果的 content。
+
+```
+Tool 消息还在，assistant 的 tool_calls 还在，用户消息还在。
+但旧 tool 的 content 变成 "[Old tool result cleared]"。
+```
+
+这样 API 校验永远不会失败——每条 `tool_call_id` 都有对应的 `tool` 消息回应，但 content 变短了，省 token。
+
+**策略**：收集所有 `tool_call_id`（按 assistant 出现的顺序），保留最近 5 个，清空更早的。
+
+#### 为什么不是删消息或按时间裁？
+
+| 方案 | 问题 |
+|------|------|
+| 删 tool 消息 | 对应的 assistant `tool_calls` 悬空 → API 400 |
+| 删 tool + 清 assistant `tool_calls` | 复杂，要考虑各种边界 |
+| 按墙钟时间裁 | 依赖时间戳持久化，会话恢复麻烦 |
+| **只清 content（本方案）** | **消息结构不变，API 永远通过，实现最简单** |
+
+#### 实现
+
+```ts
+const KEEP_RECENT = 5; // 保留最近 5 条 tool 结果的内容
+
+function compressHistory(messages: ChatCompletionMessageParam[]): void {
+  // 1. 收集所有 tool_call_id（按 assistant 的出现顺序）
+  const allToolCallIds: string[] = [];
+  for (const msg of messages) {
+    if (msg.role === "assistant") {
+      const tc = (msg as any).tool_calls;
+      if (tc?.length) {
+        for (const t of tc) allToolCallIds.push(t.id);
+      }
+    }
+  }
+
+  // 2. 算出要清空的 set
+  const keepSet = new Set(allToolCallIds.slice(-KEEP_RECENT));
+  const clearSet = new Set(allToolCallIds.filter(id => !keepSet.has(id)));
+  if (clearSet.size === 0) return;
+
+  // 3. 只替换 tool 消息的 content，其他一概不动
+  for (const msg of messages) {
+    if (msg.role === "tool" && msg.tool_call_id && clearSet.has(msg.tool_call_id)) {
+      (msg as any).content = "[Old tool result cleared]";
+    }
+  }
+}
+```
+
+#### 完整示例
+
+```
+对话调用了 8 个工具：
+
+裁剪前：
+  [sys] [user] [asst tool_calls:[c1..c8]]
+  [tool c1] [tool c2] ... [tool c8]
+
+裁剪后（保留最近 5 个）：
+  [sys] [user] [asst tool_calls:[c1..c8]]       ← 原封不动
+  [tool c1]"[Old tool result cleared]"          ← 清了
+  [tool c2]"[Old tool result cleared]"          ← 清了
+  [tool c3]"[Old tool result cleared]"          ← 清了
+  [tool c4] [tool c5] [tool c6] [tool c7] [tool c8]  ← 保留
+```
+
+assistant 消息的 `tool_calls` 和 `reasoning_content` 全部保留，消息结构完整，API 校验通过。LLM 看到 `[Old tool result cleared]` 就知道需要重新执行工具获取数据。### 方向 B：精简 System Prompt
 
 去掉 system prompt 中的工具文本描述，只保留：
 
@@ -169,65 +269,39 @@ A3. 分层保留
 
 当前 system prompt 约 1000 tokens，精简后估计 300-400 tokens，省 60%。
 
-### 方向 C：工具结果自动截断
+---
 
-在 `handleToolCall`（或 `registry.run` 返回时）对大结果做截断：
+## 实施路线图
 
-```ts
-const MAX_TOOL_OUTPUT_LENGTH = 4000;
+### Phase 1：防线1 — 工具结果截断（立竿见影）
 
-const content = result.success
-  ? (result.output.length > MAX_TOOL_OUTPUT_LENGTH
-      ? result.output.slice(0, MAX_TOOL_OUTPUT_LENGTH) +
-        `\n\n[... output truncated at ${MAX_TOOL_OUTPUT_LENGTH} chars; full output saved to temp file]`
-      : result.output)
-  : `Error: ${result.output}`;
+```
+改动范围：src/agent/loop.ts 的 handleToolCall 函数
+收益：单条大工具结果从 50k chars → ~5k chars，省 90%
+风险：极低（只是截断显示，完整文件还在）
 ```
 
-注意这里和 bash 的 30000 字符溢出文件机制的关系——bash 已经在 tool 层做了文件溢出，context 层再做截断是**第二道防线**。
+### Phase 2：防线2 — Content Eviction（Claude Code 风格）
 
-### 方向 D：Agents.md 热加载
-
-在 REPL 中每次 `runAgentTurn` 前重新读取 `Agents.md`，如果内容变了就更新 system message。
-
-或者在 `/clear` 时或 `/reload` 命令时重新加载。
-
-### 方向 E：结构化 System Prompt
-
-将 system prompt 拆分为多个 system message（OpenAI API 支持多条 system message），或使用明确的标记分隔不同区域。
-
-```ts
-messages = [
-  { role: "system", content: "你是 seekHarness..." },           // 身份
-  { role: "system", content: "工作流：1. ..." },                  // 流程
-  { role: "system", content: "## Agents Context\n${agentsMd}" }, // 用户上下文
-];
+```
+改动范围：src/agent/context.ts 的 compressHistory 函数
+行为：保留最近 5 个 tool 结果的内容，清空更早的
+收益：不动消息结构，API 校验永远通过，实现最简单
+风险：低（逻辑简单，timebased 行为可预测）
 ```
 
-实验表明，多条 system message 可以帮助 LLM 更好地区分不同层级的指令。
+---
 
-## 落地建议
+## 关键决策记录
 
-### Phase 1（立即可做）
-
-1. **工具结果截断**（方向 C）—— `src/agent/loop.ts` 中 `handleToolCall` 返回前截断，改动最小，见效快
-2. **精简 System Prompt**（方向 B）—— 删除 SYSTEM_PROMPT 中的工具文本列表
-
-### Phase 2（短期）
-
-3. **滑动窗口裁剪**（方向 A1）—— 引入 `maxContextMessages` 配置，超过后裁剪中间工具结果
-4. **Agents.md 热加载**（方向 D）—— REPL 每次 `runTurn` 前检查文件变更
-
-### Phase 3（中长期）
-
-5. **摘要压缩**（方向 A2）—— 让 LLM 定期总结进度
-6. **结构化 System Prompt**（方向 E）—— 多条 system message 分层管理
-
-## 相关代码
-
-| 文件 | 职责 |
-|---|---|
-| [src/agent/loop.ts](../src/agent/loop.ts) | `createAgentSession`（system prompt 组装 + Agents.md 加载），`runAgentTurn`（消息循环），`handleToolCall`（结果处理） |
-| [src/cli/ReplApp.tsx](../src/cli/ReplApp.tsx) | REPL UI，调用 `createAgentSession` 和 `runAgentTurn`，处理 `/clear` |
-| [src/eval/run.ts](../src/eval/run.ts) | Eval 模式下使用 `createAgentSession` + `runAgentTurn` |
-| [src/tools/types.ts](../src/tools/types.ts) | `ToolContext` 接口 |
+| 决策 | 选项 | 选择 | 理由 |
+|------|------|------|------|
+| 防线2 策略 | 删消息 / 清 content | **只清 content** | 消息结构不变，API 校验永远通过 |
+| 裁剪依据 | 按时间 / 按位置 | **按位置（最近 5 条）** | 最简单，不依赖时间戳，会话恢复无负担 |
+| 首轮 user 是否特殊保留 | 是 / 否 | **否** | 一视同仁 |
+| 裁剪标记 | 无标记 / 简短标记 | **简短标记** | 让 LLM 感知上下文有裁剪，必要时主动重新探索 |
+| 时间戳持久化 | 不需要 | **不需要** | content eviction 不依赖时间戳 |
+| 老会话恢复 | 受影响 / 不受影响 | **不受影响** | 只依赖消息结构，无外部状态 |
+| 防线1 截断策略 | 只保留开头 / 首尾保留 | **首尾保留** | LLM 需要看到结果（结尾）才能判断下一步 |
+| 防线1 文件兜底 | 不写 / 写到 outputDir | **写到 outputDir** | 保证 LLM 按"Use read tool"能找到完整文件 |
+| 与 tool 层溢出机制的关系 | 替代 / 共存 | **共存（两道防线）** | tool 层存完整文件，context 层做显示截断 |

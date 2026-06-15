@@ -68,6 +68,7 @@ def write_predictions_file(preds: list[dict], out_path: Path) -> None:
 def run_swebench(
     predictions_file: Path,
     dataset_file: Path,
+    instance_ids: list,
     run_id: str,
     report_dir: Path,
     max_workers: int,
@@ -82,6 +83,7 @@ def run_swebench(
     swebench_main(
         dataset_name=str(dataset_file),
         split="test",
+        instance_ids=instance_ids,
         predictions_path=str(predictions_file),
         max_workers=max_workers,
         force_rebuild=force_rebuild,
@@ -185,6 +187,7 @@ def main() -> int:
         run_swebench(
             predictions_file=predictions_file,
             dataset_file=args.dataset,
+            instance_ids=instance_ids,
             run_id=args.run_id,
             report_dir=args.report_dir,
             max_workers=args.max_workers,

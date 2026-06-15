@@ -27,7 +27,33 @@ export type BashInput = z.infer<typeof bashSchema>;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
 const OUTPUT_CHAR_CAP = 30_000;
-const SIGKILL_GRACE_MS = 5_000;
+
+/**
+ * 如果一个命令持续运行超过超时时间（如 npm run dev），
+ * 我们不杀它，而是 detach 并返回已有输出。
+ * 但为了不无限等待 close 事件（Windows 上 orphaned 子进程可能
+ * 持住 pipe 句柄导致 close 永不触发），设置一个较短的安全兜底。
+ */
+const DETACH_GRACE_MS = 2_000;
+
+/**
+ * 全局进程注册表，用于追踪被 detach 的后台进程。
+ * Session 结束时 cleanup 调此函数杀掉所有孤儿进程。
+ */
+const backgroundProcesses = new Map<string, { pid: number; label: string }>();
+let bgCounter = 0;
+export function getBackgroundProcesses() {
+  return Array.from(backgroundProcesses.entries());
+}
+export function cleanupBackgroundProcesses(): void {
+  const isWin = process.platform === "win32";
+  for (const [id, info] of backgroundProcesses) {
+    try {
+      killProcessTree(info.pid, isWin);
+    } catch { /* ignore */ }
+    backgroundProcesses.delete(id);
+  }
+}
 
 export const bashTool: Tool<BashInput> = {
   meta: {
@@ -38,6 +64,7 @@ export const bashTool: Tool<BashInput> = {
         "Run a shell command in the workspace root. Default 2min timeout, max 10min. " +
         "Output >30000 chars is truncated and saved to a temp file (path returned). " +
         "Returns exit code in the output. " +
+        "Append ' &' at the end to start a background process (detached). " +
         "Destructive commands (rm -rf /, mkfs, curl|sh, fork bombs, etc.) are blocked by default; " +
         "set SEEKHARNESS_ALLOW_DANGEROUS=1 to allow them.",
       parameters: {
@@ -82,20 +109,34 @@ export const bashTool: Tool<BashInput> = {
       };
     }
 
-    // 3. 确定超时
+    // 3. 检测 background 命令（以 & 结尾）
+    const trimmedCmd = input.command.trimEnd();
+    const isBackground = trimmedCmd.endsWith(" &");
+    const realCmd = isBackground ? trimmedCmd.slice(0, -2).trimEnd() : trimmedCmd;
+
+    // 4. 如果是 background，detach 后立即返回
+    if (isBackground) {
+      runBackground(realCmd, ctx.workspaceRoot);
+      return {
+        success: true,
+        output: `$ ${input.command}\n[Background process started]`,
+      };
+    }
+
+    // 5. 确定超时
     const timeoutMs = Math.min(
       input.timeout ?? DEFAULT_TIMEOUT_MS,
       MAX_TIMEOUT_MS
     );
 
-    // 4. 执行
-    const result = await runCommand(input.command, {
+    // 6. 执行
+    const result = await runCommand(realCmd, {
       cwd: ctx.workspaceRoot,
       timeoutMs,
       signal: ctx.signal,
     });
 
-    // 5. 处理超时
+    // 7. 处理超时
     if (result.timedOut) {
       return {
         success: false,
@@ -105,7 +146,7 @@ export const bashTool: Tool<BashInput> = {
       };
     }
 
-    // 6. 处理取消
+    // 8. 处理取消
     if (result.cancelled) {
       return {
         success: false,
@@ -113,12 +154,12 @@ export const bashTool: Tool<BashInput> = {
       };
     }
 
-    // 7. 拼接 stdout + stderr
+    // 9. 拼接 stdout + stderr
     const combined = result.stderr
       ? `${result.stdout}${result.stdout ? "\n" : ""}[stderr]\n${result.stderr}`
       : result.stdout;
 
-    // 8. 输出截断 + 写临时文件
+    // 10. 输出截断 + 写临时文件
     const truncated = await handleLargeOutput(combined, ctx.largeOutputDir);
 
     const exitNote = result.exitCode === 0 ? "" : `\n(exit ${result.exitCode})`;
@@ -129,12 +170,63 @@ export const bashTool: Tool<BashInput> = {
   },
 };
 
+/**
+ * 启动一个后台进程，detach 并 unref，不等待它退出。
+ * 用于处理以 & 结尾的命令（如 `npm run dev &`）。
+ */
+function runBackground(command: string, cwd: string): void {
+  const isWin = process.platform === "win32";
+  const proc = isWin
+    ? spawn("cmd.exe", ["/d", "/s", "/c", command], {
+        cwd,
+        windowsHide: true,
+        shell: false,
+        detached: true,
+        stdio: "ignore",
+      })
+    : spawn("sh", ["-c", command], {
+        cwd,
+        shell: false,
+        detached: true,
+        stdio: "ignore",
+      });
+  proc.unref();
+}
+
 interface CommandResult {
   stdout: string;
   stderr: string;
   exitCode: number;
   timedOut: boolean;
   cancelled: boolean;
+}
+
+/**
+ * Kill an entire process tree.
+ * - On Windows: uses `taskkill /F /T` to kill the tree (critical for `cmd.exe /c npm run dev`
+ *   scenarios where orphaned children hold the stdout pipe open, preventing the 'close' event).
+ * - On POSIX: sends SIGTERM to the process group (negative pid).
+ */
+function killProcessTree(pid: number, isWin: boolean): void {
+  if (isWin) {
+    try {
+      const child = spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.unref();
+    } catch {
+      // silently fall back to just killing the direct child
+      try { process.kill(pid, "SIGTERM"); } catch { /* ignore */ }
+    }
+  } else {
+    // POSIX: kill the process group (negative pid = pgid)
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      try { process.kill(pid, "SIGTERM"); } catch { /* ignore */ }
+    }
+  }
 }
 
 function runCommand(
@@ -148,7 +240,7 @@ function runCommand(
       return;
     }
 
-    // Windows: cmd.exe /c <command>; POSIX 暂用 sh -c
+    // Windows: cmd.exe /c <command>; POSIX 用 sh -c
     const isWin = process.platform === "win32";
     const proc = isWin
       ? spawn("cmd.exe", ["/d", "/s", "/c", command], {
@@ -173,13 +265,40 @@ function runCommand(
       stderr += chunk.toString("utf-8");
     });
 
+    // ── Safety: flag + fallback timer to prevent hanging if close never fires ──
+    let resolved = false;
+    let safetyTimer: NodeJS.Timeout | undefined;
+
+    function forceResolve(reason: "timeout" | "cancelled" | "error" | "close") {
+      if (resolved) return;
+      resolved = true;
+      cleanup();
+      if (reason === "timeout") {
+        resolve({
+          stdout,
+          stderr: stderr + "\n[Process timed out; forcefully resolved]",
+          exitCode: 1,
+          timedOut: true,
+          cancelled: false,
+        });
+      } else if (reason === "cancelled") {
+        resolve({
+          stdout,
+          stderr: stderr + "\n[Process cancelled; forcefully resolved]",
+          exitCode: 1,
+          timedOut: false,
+          cancelled: true,
+        });
+      }
+    }
+
     // ── Timeout timer ──
     const timer = setTimeout(() => {
       killed = true;
-      proc.kill("SIGTERM");
-      setTimeout(() => {
-        if (!proc.killed) proc.kill("SIGKILL");
-      }, SIGKILL_GRACE_MS);
+      killProcessTree(proc.pid!, isWin);
+      // Safety fallback: if close event doesn't fire within 7s (Windows: orphaned
+      // children like npm/node may still hold the stdout pipe handle), force-resolve.
+      safetyTimer = setTimeout(() => forceResolve("timeout"), DETACH_GRACE_MS + 2000);
     }, opts.timeoutMs);
 
     // ── AbortSignal listener ──
@@ -187,38 +306,43 @@ function runCommand(
       if (killed) return; // already handled by timeout
       killed = true;
       cancelled = true;
-      proc.kill("SIGTERM");
-      setTimeout(() => {
-        if (!proc.killed) proc.kill("SIGKILL");
-      }, SIGKILL_GRACE_MS);
+      killProcessTree(proc.pid!, isWin);
+      safetyTimer = setTimeout(() => forceResolve("cancelled"), DETACH_GRACE_MS + 2000);
     };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     const cleanup = () => {
       clearTimeout(timer);
+      clearTimeout(safetyTimer);
       opts.signal?.removeEventListener("abort", onAbort);
     };
 
     proc.on("error", (err) => {
       cleanup();
-      resolve({
-        stdout,
-        stderr: stderr || err.message,
-        exitCode: 1,
-        timedOut: false,
-        cancelled: false,
-      });
+      if (!resolved) {
+        resolved = true;
+        resolve({
+          stdout,
+          stderr: stderr || err.message,
+          exitCode: 1,
+          timedOut: false,
+          cancelled: false,
+        });
+      }
     });
 
     proc.on("close", (code) => {
       cleanup();
-      resolve({
-        stdout,
-        stderr,
-        exitCode: code ?? 0,
-        timedOut: killed && !cancelled,
-        cancelled,
-      });
+      if (!resolved) {
+        resolved = true;
+        resolve({
+          stdout,
+          stderr,
+          exitCode: code ?? 0,
+          timedOut: killed && !cancelled,
+          cancelled,
+        });
+      }
     });
   });
 }

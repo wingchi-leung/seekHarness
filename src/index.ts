@@ -58,7 +58,7 @@ async function main(): Promise<void> {
   // 解析 resume 参数：__latest__ → 找最新的会话 ID
   let resumeSessionId: string | undefined;
   if (rawResumeId === "__latest__") {
-    resumeSessionId = (await getLatestSessionId()) ?? undefined;
+    resumeSessionId = (await getLatestSessionId(workspaceRoot)) ?? undefined;
     if (!resumeSessionId) {
       console.error("没有找到可恢复的历史会话。");
       process.exit(1);
