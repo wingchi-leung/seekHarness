@@ -102,34 +102,54 @@ def run_swebench(
 
 
 def aggregate_reports(run_id: str, report_dir: Path, instance_ids: list[str]) -> dict:
-    """Walk the per-instance report.json files swebench wrote and sum them up."""
-    # swebench writes a nested structure: <report_dir>/<run_id>/<model_name>/<instance_id>/report.json
-    # The model name "seekharness" is what we passed in collect_predictions.
-    candidates = list(report_dir.rglob("report.json"))
-    if not candidates:
-        print("WARN: no report.json files found — evaluation may have failed", file=sys.stderr)
+    """Aggregate swebench 4.1.0 results.
 
+    swebench 4.1.0 writes a single top-level file: seekharness.<run_id>.json
+    in the CWD, in addition to per-instance report.json files under
+    <report_dir>/<run_id>/seekharness/<id>/report.json.
+    We try the top-level file first (most reliable), then fall back to
+    walking individual report.json files.
+    """
     per_instance: dict[str, dict] = {}
-    for rf in candidates:
-        try:
-            data = json.loads(rf.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"  could not parse {rf}: {e}", file=sys.stderr)
-            continue
-        if not isinstance(data, dict):
-            continue
-        iid = next(iter(data))
-        if iid in per_instance:
-            # keep first; should not happen
-            continue
-        per_instance[iid] = data[iid]
 
-    # ensure every requested instance has a record (missing = not run / errored)
+    # 1) Try the swebench 4.1.0 top-level results file
+    toplevel = Path(f"seekharness.{run_id}.json")
+    if toplevel.exists():
+        try:
+            data = json.loads(toplevel.read_text(encoding="utf-8"))
+            # Format: { instance_id: { "resolved": bool, ... }, ... }
+            for iid, v in data.items():
+                if isinstance(v, dict):
+                    per_instance[iid] = v
+                # skip string-valued keys (metadata)
+        except Exception as e:
+            print(f"  could not parse {toplevel}: {e}", file=sys.stderr)
+
+    # 2) Fall back to per-instance report.json files
+    if not per_instance:
+        candidates = list(report_dir.rglob("report.json"))
+        if not candidates:
+            print("WARN: no report files found — evaluation may have failed", file=sys.stderr)
+        for rf in candidates:
+            try:
+                data = json.loads(rf.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"  could not parse {rf}: {e}", file=sys.stderr)
+                continue
+            if not isinstance(data, dict):
+                continue
+            for iid, v in data.items():
+                if isinstance(v, dict) and iid not in per_instance:
+                    per_instance[iid] = v
+
+    # ensure every requested instance has a record
     for iid in instance_ids:
         per_instance.setdefault(iid, {"resolved": False, "missing": True})
 
-    passed = sorted(iid for iid, r in per_instance.items() if r.get("resolved"))
-    failed = sorted(iid for iid, r in per_instance.items() if not r.get("resolved"))
+    passed = sorted(iid for iid, r in per_instance.items()
+                    if isinstance(r, dict) and r.get("resolved"))
+    failed = sorted(iid for iid, r in per_instance.items()
+                    if not (isinstance(r, dict) and r.get("resolved")))
     n = len(per_instance)
     return {
         "run_id": run_id,

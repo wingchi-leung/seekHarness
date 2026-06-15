@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wsl --list --verbose)",
+      "Bash(python -c ' *)",
+      "Bash(npx tsc *)"
+    ]
+  }
+}
